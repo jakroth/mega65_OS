@@ -1,0 +1,567 @@
+// Xmega65 Kernam Development Template
+// Each function of the kernal is a no-args function
+// The functions are placed in the SYSCALLS table surrounded by JMP and NOP
+
+import "string.kc"
+
+// Use a linker definition file (put the previous listing into that file)
+#pragma link("mega65hyper.ld")
+
+// Some definitions of addresses and special values that this program uses
+const char * RASTER = 0xd012;
+const char * VIC_MEMORY = 0xd018;
+const char * SCREEN = 0x0400;
+const char * BGCOL = 0xd021;
+const char * COLS = 0xd800;
+const char BLACK = 0;
+const char WHITE = 1;
+
+// Some text to display
+char[] MESSAGE = "checkpoint3.5 by pill0032";
+char[] VICII = "vic-ii";
+char[] MOS6526 = "mos6526";
+
+
+// Additional global variables for functions
+unsigned char * current_screen_line = $0400;
+unsigned word current_screen_x = 0;
+
+
+void main(){
+  // empty main function for now
+}
+
+
+// FUNCTION to trigger exit from Hypervisor mode
+void exit_hypervisor()
+{
+  *(unsigned char*)$D67F = $01;
+}
+
+
+// FUNCTION to print a message on the screen
+void print_to_screen(char * message){
+
+  // Copy the message from the array memory to the screen location memory
+  while(*message){
+    *(current_screen_line + current_screen_x) = *message++;
+    current_screen_x++;
+  }
+}
+
+
+// FUNCTION to move the current message line down one position
+void print_newline(){
+  current_screen_line += 40;
+  current_screen_x = 0;
+}
+
+  
+// FUNCTION to continuously print RASTER lines (careful, doesn't ever end)
+void print_raster_lines(){
+  // Continuous loop showing two white lines as raster bars
+  while(true){
+    if(*RASTER==54 || *RASTER==66){
+      *BGCOL = WHITE;
+    } else {
+      *BGCOL = BLACK;
+    }
+  } // end while
+}
+
+
+// FUNCTION to make an array of hex values out of a binary number
+char[] make_hex(word value){
+  char[5] hex;
+  byte i;
+  for(i=0;i<4;i++){
+    if(value<0xa000) hex[i]='0'+(char)(value>>12);
+    else hex[i]=(char)(value>>12)-9;
+    value<<=4;
+  }
+  hex[4]=0;
+  return hex;
+}
+
+
+// FUNCTION to print a hexidecimal value
+void print_hex(word value){
+ char[5] print_hex = make_hex(value);
+ print_to_screen(print_hex);
+}
+
+
+// FUNCTION to test memory
+void test_memory(){
+  word mem_start = $0800;
+  word mem_end = $0800;
+  volatile byte * p;
+  byte flag = 0;
+
+  for(p = $0800; p < $8000; p++){ // tests each memory location
+     for(byte i = 0; i < 255; i++){  // test each value of a byte (0-255)
+       *p = i;
+
+       if(*p != i){ // checks if value returned from *p is the same as saved
+       	flag = 1;
+        mem_end = (p-1);
+       	print_to_screen("memory error at $");
+       	print_hex((word)p);
+       	print_newline();
+       	break;
+       }
+    }
+    if(flag==1)break;
+  }
+  print_to_screen("memory found at $");
+  print_hex(mem_start);
+  print_to_screen(" - $");
+  print_hex((unsigned short)p);
+}
+
+
+// FUNCTION to print memory locations and their contents
+void print_mem(){
+  volatile byte * p;
+  for(word i=$DC00; i<$DC20; i++){
+    p = i;
+    
+    // if(*p > 0 && *p < 24){
+    print_hex(*p);
+    print_to_screen("/");
+    print_hex((word)p);
+    print_to_screen(" ");}
+  //}
+
+  for(dword i=1;i<2000000;i++) continue;  // wait at least 1 second
+
+  print_to_screen("                                                  ");
+  for(word i=$DC00; i<$DC20; i++){
+    p = i;
+    
+    print_hex(*p);
+    print_to_screen("/");
+    print_hex((word)p);
+    print_to_screen(" ");}
+}
+
+// FUNCTION to print the time
+void print_time(){
+  print_to_screen("the time is: ");  
+  for(dword i=1;i<3000000;i++) continue;  // wait at least 1 second
+
+  volatile byte * p;
+  p = $DC1B;
+  print_hex(*p);
+  print_to_screen(":");
+  p = $DC1A;
+  print_hex(*p);
+  print_to_screen(":");
+  p = $DC19;
+  print_hex(*p);
+
+  print_newline();
+}
+
+
+// DEVICE DETECTION ROUTINES
+// Define a struct to store info about devices
+struct device_memory_allocation {
+  word first_address;  // start of the device's memory
+  word last_address;   // end of the device's memory
+  char * device_name;  // holds the name of the device
+};
+
+
+// Create count of the number of devices
+byte device_allocation_count = 0;
+
+
+// Create an array to hold device memory register structs
+export struct device_memory_allocation[16] device_memory_allocations;
+
+
+// FUNCTION to populate arrays with devices memory registers
+void populate_array(byte type, word address){
+
+  if(type==0){
+    device_memory_allocations[device_allocation_count].first_address = address;
+    device_memory_allocations[device_allocation_count].last_address = address + $007F;
+    device_memory_allocations[device_allocation_count].device_name = "vic-ii";
+    device_allocation_count++;
+    device_memory_allocations[device_allocation_count].first_address = address + $0100;
+    device_memory_allocations[device_allocation_count].last_address = address + $03FF;
+    device_memory_allocations[device_allocation_count].device_name = "vic-ii";
+    device_allocation_count++;
+    device_memory_allocations[device_allocation_count].first_address = address + $0800;
+    device_memory_allocations[device_allocation_count].last_address = address + $0BFF;
+    device_memory_allocations[device_allocation_count].device_name = "vic-ii";
+    device_allocation_count++;
+  }
+  if(type==1){
+    device_memory_allocations[device_allocation_count].first_address = address;
+    device_memory_allocations[device_allocation_count].last_address = address + $00FF;
+    device_memory_allocations[device_allocation_count].device_name = "mos6526";
+    device_allocation_count++;
+  }
+}
+
+
+// FUNCTION to print the device memory register array
+void print_device_array(){
+  for(byte i = 0; i < device_allocation_count; i++){
+    print_to_screen(device_memory_allocations[i].device_name);
+    print_to_screen(" at $");
+    print_hex(device_memory_allocations[i].first_address);
+    print_to_screen(" to $");
+    print_hex(device_memory_allocations[i].last_address);
+    print_newline();
+  }
+}
+
+// FUNCTION to check if a memory address is free to use
+bool check_mem(word address){
+  bool check = true;
+  for(byte i = 0; i < device_allocation_count; i++){
+    if(address>=device_memory_allocations[i].first_address && address<=device_memory_allocations[i].last_address)check = false;
+  }
+  return check;
+}
+
+
+// FUNCTION to detect VIC-II devices
+word detect_vicii(word address){
+  volatile byte * p = address;
+  byte v1,v2;
+
+  v1=p[$12]; // read start address + $12;
+  for(word i=1;i<1000;i++) continue;  // wait at least 64 microseconds
+  v2=p[$12]; // read again
+
+  if(v2>v1) {
+    print_to_screen("found vic-ii");
+    print_newline();
+    populate_array(0,(word)p);
+    return $007F;
+  }
+  return 0;
+}
+
+
+// FUNCTION to detect MOS6526 devices
+word detect_mos6526(word address){
+  volatile byte * p = address;
+  byte t1,t2,t3,t4;
+  
+  t1=p[$19]; // read start address + $09 (seconds)
+  t2=p[$1A]; // read start address + $0A (minutes or something like it)
+  t3=p[$1B]; // read start address + $0B (hours)
+
+  if(t3>0 && t3<24){
+    for(dword i=1;i<3000000;i++) continue;  // wait at least 1 second
+    t4=p[$19];
+    if(t4>t1){
+      print_to_screen("found mos6526");
+      print_newline();
+      populate_array(1,(word)p);
+      return $00FF;
+    }
+  }
+  return 0;
+}
+
+
+// FUNCTION to detect all hardware devices
+void detect_devices(){
+  volatile word advance = 0;
+
+  for(dword i=1;i<2000000;i++) continue;  // wait at least 1 second
+
+  for(word i=$D000; i<=$DFFF; i++){ // tests memory for devices
+    print_hex(i); // prints the current memory address being tested
+    current_screen_x = 0; // resets the screen printer to the start of the line
+    if(check_mem(i)){
+      advance = 0;
+      advance = detect_vicii(i);
+      if(advance>0){
+	i+=advance;
+      }
+    }
+    if(check_mem(i)){
+      advance = 0;
+      advance = detect_mos6526(i);
+      if(advance>0){
+	i+=advance;
+      }
+    }
+  }
+  print_to_screen("finished probing for devices");
+  print_newline();
+}
+
+
+// Defining the functions/behvaiours of syscalls and traps
+// SYSCALL FUNCTIONS
+void syscall00(){exit_hypervisor();}
+void syscall01(){exit_hypervisor();}
+void syscall02(){exit_hypervisor();}
+void syscall03(){exit_hypervisor();}
+void syscall04(){exit_hypervisor();}
+void syscall05(){exit_hypervisor();}
+void syscall06(){exit_hypervisor();}
+void syscall07(){exit_hypervisor();}
+void syscall08(){exit_hypervisor();}
+void syscall09(){exit_hypervisor();}
+void syscall0A(){exit_hypervisor();}
+void syscall0B(){exit_hypervisor();}
+void syscall0C(){exit_hypervisor();}
+void syscall0D(){exit_hypervisor();}
+void syscall0E(){exit_hypervisor();}
+void syscall0F(){exit_hypervisor();}
+void syscall10(){exit_hypervisor();}
+void securentr(){exit_hypervisor();}
+void securexit(){exit_hypervisor();}
+void syscall13(){exit_hypervisor();}
+void syscall14(){exit_hypervisor();}
+void syscall15(){exit_hypervisor();}
+void syscall16(){exit_hypervisor();}
+void syscall17(){exit_hypervisor();}
+void syscall18(){exit_hypervisor();}
+void syscall19(){exit_hypervisor();}
+void syscall1A(){exit_hypervisor();}
+void syscall1B(){exit_hypervisor();}
+void syscall1C(){exit_hypervisor();}
+void syscall1D(){exit_hypervisor();}
+void syscall1E(){exit_hypervisor();}
+void syscall1F(){exit_hypervisor();}
+void syscall20(){exit_hypervisor();}
+void syscall21(){exit_hypervisor();}
+void syscall22(){exit_hypervisor();}
+void syscall23(){exit_hypervisor();}
+void syscall24(){exit_hypervisor();}
+void syscall25(){exit_hypervisor();}
+void syscall26(){exit_hypervisor();}
+void syscall27(){exit_hypervisor();}
+void syscall28(){exit_hypervisor();}
+void syscall29(){exit_hypervisor();}
+void syscall2A(){exit_hypervisor();}
+void syscall2B(){exit_hypervisor();}
+void syscall2C(){exit_hypervisor();}
+void syscall2D(){exit_hypervisor();}
+void syscall2E(){exit_hypervisor();}
+void syscall2F(){exit_hypervisor();}
+void syscall30(){exit_hypervisor();}
+void syscall31(){exit_hypervisor();}
+void syscall32(){exit_hypervisor();}
+void syscall33(){exit_hypervisor();}
+void syscall34(){exit_hypervisor();}
+void syscall35(){exit_hypervisor();}
+void syscall36(){exit_hypervisor();}
+void syscall37(){exit_hypervisor();}
+void syscall38(){exit_hypervisor();}
+void syscall39(){exit_hypervisor();}
+void syscall3A(){exit_hypervisor();}
+void syscall3B(){exit_hypervisor();}
+void syscall3C(){exit_hypervisor();}
+void syscall3D(){exit_hypervisor();}
+void syscall3E(){exit_hypervisor();}
+void syscall3F(){exit_hypervisor();}
+
+
+// TRAP FUNCTIONS
+void reset(){
+  // Initialise screen memory, and selects correct font
+  *VIC_MEMORY = 0x14;
+  // Fill the screen with spaces
+  memset(SCREEN,' ',40*25);
+  // Set the colour of every character on the screen to white
+  memset(COLS,WHITE,40*25);
+
+  // print these messages on the screens
+  print_to_screen("pill0032 operating system starting...");
+  print_newline();
+  print_to_screen("testing hardware");
+  print_newline();
+  //print_time();
+
+
+  // TESTS
+  // Run the memory test
+  // test_memory();
+  // print_to_screen("finished testing hardware");
+  // print_newline();
+
+  // Run the device check
+  detect_devices();
+  print_device_array();
+
+
+  // print_mem();
+
+  // loop to stop the rest of the code executing (for now)
+  while(true){
+  }
+} // end reset function
+
+void pagfault(){exit_hypervisor();}
+void restorkey(){exit_hypervisor();}
+void alttabkey(){exit_hypervisor();}
+void vF011rd(){exit_hypervisor();}
+void vF011wr(){exit_hypervisor();}
+// Can define specific functions for all the reserved traps later
+void reserved(){exit_hypervisor();}
+void cpukil(){exit_hypervisor();}
+
+
+// Now we select the SYSCALL segment to hold the SYSCALL/trap entry point table
+
+#pragma data_seg(Syscall)
+
+// The structure of each entry point is JMP (handler address) + NOP.
+// We have a char (xjmp) to hold the opcode for the JMP instruction,
+// and then put the address of the SYSCALL/trap handler in the next 
+// two points as a pointer, and end with the NOP instruction opcode.
+
+struct SysCall {
+  char xjmp;           // Holds $4C, the JMP $nnnn opcode
+  void()* syscall;     // Holds the handler address, will be the target of the JMP
+  char xnop;           // Holds $EA, the NOP opcode
+};
+
+// To save writing 0x4C and 0xEA all the time, we define them as constants
+const char JMP = 0x4c;
+const char NOP = 0xea;
+
+// Now we can have a nice table of up to 64 SYSCALL handlers expressed 
+// in a fairly readable and easy format.
+// Each line is an instance of the struct SysCall from above, with the JMP
+// opcode value, the address of the handler routine and the NOP opcode value
+export struct SysCall[] SYSCALLS = {
+{JMP,&syscall00,NOP},
+{JMP,&syscall01,NOP},
+{JMP,&syscall02,NOP},
+{JMP,&syscall03,NOP},
+{JMP,&syscall04,NOP},
+{JMP,&syscall05,NOP},
+{JMP,&syscall06,NOP},
+{JMP,&syscall07,NOP},
+{JMP,&syscall08,NOP},
+{JMP,&syscall09,NOP},
+{JMP,&syscall0A,NOP},
+{JMP,&syscall0B,NOP},
+{JMP,&syscall0C,NOP},
+{JMP,&syscall0D,NOP},
+{JMP,&syscall0E,NOP},
+{JMP,&syscall0F,NOP},
+{JMP,&syscall10,NOP},
+{JMP,&securentr,NOP},
+{JMP,&securexit,NOP},
+{JMP,&syscall13,NOP},
+{JMP,&syscall14,NOP},
+{JMP,&syscall15,NOP},
+{JMP,&syscall16,NOP},
+{JMP,&syscall17,NOP},
+{JMP,&syscall18,NOP},
+{JMP,&syscall19,NOP},
+{JMP,&syscall1A,NOP},
+{JMP,&syscall1B,NOP},
+{JMP,&syscall1C,NOP},
+{JMP,&syscall1D,NOP},
+{JMP,&syscall1E,NOP},
+{JMP,&syscall1F,NOP},
+{JMP,&syscall20,NOP},
+{JMP,&syscall21,NOP},
+{JMP,&syscall22,NOP},
+{JMP,&syscall23,NOP},
+{JMP,&syscall24,NOP},
+{JMP,&syscall25,NOP},
+{JMP,&syscall26,NOP},
+{JMP,&syscall27,NOP},
+{JMP,&syscall28,NOP},
+{JMP,&syscall29,NOP},
+{JMP,&syscall2A,NOP},
+{JMP,&syscall2B,NOP},
+{JMP,&syscall2C,NOP},
+{JMP,&syscall2D,NOP},
+{JMP,&syscall2E,NOP},
+{JMP,&syscall2F,NOP},
+{JMP,&syscall30,NOP},
+{JMP,&syscall31,NOP},
+{JMP,&syscall32,NOP},
+{JMP,&syscall33,NOP},
+{JMP,&syscall34,NOP},
+{JMP,&syscall35,NOP},
+{JMP,&syscall36,NOP},
+{JMP,&syscall37,NOP},
+{JMP,&syscall38,NOP},
+{JMP,&syscall39,NOP},
+{JMP,&syscall3A,NOP},
+{JMP,&syscall3B,NOP},
+{JMP,&syscall3C,NOP},
+{JMP,&syscall3D,NOP},
+{JMP,&syscall3E,NOP},
+{JMP,&syscall3F,NOP}
+};
+
+// Originally we had only two SYSCALLs defined, so "align" tells KickC to
+//  make the TRAP table begin at the next multiple of $100, i.e., at $8100.
+export align (0x100) struct SysCall[] TRAPS = {
+  {JMP,&reset,NOP},
+  {JMP,&pagfault,NOP},
+  {JMP,&restorkey,NOP},
+  {JMP,&alttabkey,NOP},
+  {JMP,&vF011rd,NOP},
+  {JMP,&vF011wr,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&cpukil,NOP}
+};
+
+
+
