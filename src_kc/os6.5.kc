@@ -1,0 +1,1038 @@
+// XMega65 Kernal Development Template
+// Each function of the kernal is a no-args function
+// The functions are placed in the SYSCALLS table surrounded by JMP and NOP
+
+#pragma cpu(rom6502)
+
+import "string"
+
+// Use a linker definition file (put the previous listing into that file)
+#pragma link("mega65hyper.ld")
+
+// Some definitions of addresses and special values that this program uses
+const char* RASTER = 0xd012;
+const char* VIC_MEMORY = 0xd018;
+const char* SCREEN = 0x0400;
+const char* BGCOL = 0xd021;
+const char* COLS = 0xd800;
+const char BLACK = 0;
+const char BLUE = 6;
+const char WHITE = 1;
+
+// Some text to display
+char[] MESSAGE = "checkpoint 6.5 pill0032";
+
+// Additional global variables for functions
+volatile byte *current_screen_line = SCREEN;
+volatile byte current_screen_x = 0;
+
+
+
+// ***********  PRINTING functions ***************
+
+// FUNCTION to print a character at the current screen pointer
+void print_char(char c)
+{
+   current_screen_line[current_screen_x++]=c;
+}
+
+
+// FUNCTION to print a string message at the current screen pointer
+void print_to_screen(char *message)
+{
+  char *c=message;
+  while(*c) {
+    current_screen_line[current_screen_x++]=*c;
+    c++;
+  }
+}
+
+
+// FUNCTION to move the screen pointer to a new line
+void print_newline()
+{
+  current_screen_line+=40;
+  current_screen_x=0;
+}
+
+
+// FUNCTION to print a value in the hex format
+void print_hex(word value)
+{
+  char[5] hex;
+  byte i;
+  for(i=0;i<8;i++) {
+    if (value<0xa000) hex[i]='0'+(char)(value>>12);
+    else hex[i]=(char)(value>>12)-9;
+    value<<=4;
+  }
+  hex[4]=0;
+  print_to_screen(hex);
+}
+
+
+// FUNCTION to print a larger value in hex format
+void print_dhex(dword value)
+{
+  print_hex((word)(value>>16));
+  print_hex((word)value);
+}
+
+
+// FUNCTION to continuously print RASTER lines (careful, doesn't ever end)
+void print_raster_lines(){
+  // Continuous loop showing two white lines as raster bars
+  while(true){
+    if(*RASTER==54 || *RASTER==66){
+      *BGCOL = WHITE;
+    } else {
+      *BGCOL = BLUE;
+    }
+  } // end while
+}
+
+
+
+
+// ***********  DMA and MEMORY functions  ***************
+
+// STRUCT to define DMA, to use in the dma_copy function
+struct dma_list {
+  byte request_format0a;
+  byte source_mb_option80;
+  byte source_mb;
+  byte dest_mb_option81;
+  byte dest_mb;
+  byte end_of_options00;
+
+  byte cmd; // $00 = copy + end of list
+  word size;
+  word source_addr;
+  byte source_bank;
+  word dest_addr;
+  byte dest_bank;
+  byte modulo00;
+};
+
+
+// FUNCTION to copy memory ranges
+void dma_copy(dword src,dword dest,word length)
+{
+  struct dma_list list;
+  list.request_format0a=$0a;
+  list.source_mb_option80=$80;
+  list.dest_mb_option81=$81;
+  list.end_of_options00=$00;
+  list.cmd=$00;
+  list.modulo00=$00;
+
+  list.size=length;
+  list.dest_mb=(byte)(dest>>20);
+  list.dest_bank=(dest>>16)&0x7f;
+  list.dest_addr=(word)dest;
+
+  // Work around missing fragments in KickC
+  list.source_mb=(byte)(src>>20);
+  list.source_bank=(src>>16)&0x7f;
+
+  list.source_addr=(word)src;
+
+  // DMA list lives in hypervisor memory, so use correct list address when triggering
+  // (Variables in KickC usually end up in ZP, so we have to provide the base page correction
+  if (!(>&list))
+    *(byte *)$D701 = $BF+(>&list);
+  else
+    *(byte *)$D701 = (>&list);
+    *(byte *)$D702 = $7F;
+    *(byte *)$D704 = $FF;
+    *(byte *)$D705 = <&list;
+}
+
+
+// DEFINES a variable to use in the lpeek function
+volatile byte lpeek_value = $12;
+
+// FUNCTION to peek at an address, to avoid KickC issues
+byte lpeek(dword address)
+{
+  // Work around all sorts of fun problems in KickC
+  //  dma_copy(address,$BF00+((unsigned short)<&lpeek_value),1);
+  dword t = (dword)&lpeek_value;
+  if (>((word)&lpeek_value)) t+=$FFF0000;
+  else t += $FFFBF00;
+
+  byte *c = $BF00 + (byte *)&t;
+
+  dma_copy(address,t,1);
+
+  return lpeek_value;
+}
+
+
+
+
+
+// ***********  PROCESS DESCRIPTOR BLOCKS (PBDs)  ***************
+
+// CONSTANTS for the PDB functions below
+const byte STATE_NEW = $01;
+const byte STATE_READY = $02;
+const byte STATE_READYSUSPENDED = $03;
+const byte STATE_BLOCKEDSUSPENDED = $04;
+const byte STATE_BLOCKED = $05;
+const byte STATE_RUNNING = $06;
+const byte STATE_EXIT = $07;
+
+
+
+// STRUCT for the Process Descriptor Block (struct definition)
+struct process_descriptor_block {
+  // Unique identifier for the process
+  byte process_id;
+  // Current state of the process
+  byte process_state;
+  // Human readable name of the process
+  char * process_name;
+  // Where this process is stored when not running
+  //i.e., where in the $20000-$5FFFF memory range the process is stored when not running.
+  dword storage_start_address;
+  dword storage_end_address;
+  // Stored registers and related machine state for this process (for the $D640-$D67E machine state registers)
+  byte * stored_state;
+};
+
+
+
+// DEFINES the space to save the stored_states for the 8 Process Descriptor Blocks
+// Process Descriptor Block stored states will live at $C000-$C7FF, with 256 bytes for each
+const byte *stored_pdbs = $C000;
+// 8 processes x 16 bytes = 128 bytes for names
+const char *process_names = $C800;
+// 8 processes x 64 bytes = 512 bytes for context state
+const byte *process_context_states = $C900;
+
+
+
+// VARIABLES to use in the PDB functions below
+// Which is the current running process? Set this in the function resume_pbd().
+volatile byte running_pdb=$ff;
+// Counter for helping determine the next available process ID.
+volatile byte pid_counter=0;
+
+
+
+
+// FUNCTION to find the next available processor id (I think assumes 8 processors)
+byte next_free_pid()
+{
+  word i;
+  // Start with the next process ID
+  byte pid = ++pid_counter;
+
+  // then make sure that it isn't currently in use by another process
+  // This loop must terminate according to the Pigeon Hole Principlle,
+  // i.e., there are more possible PIDs than there are processes,  (cause PIDs can go to 256)
+  // so iterating through them will find at least one.
+  byte stepped=1;
+  while(stepped) {
+    stepped=0;
+    for(i=0;i<8;i++) {
+      struct process_descriptor_block *p
+        =(struct process_descriptor_block*)((word)stored_pdbs+(i<<8));
+      if (pid==p->process_id) { pid++; stepped=1; }
+    }
+  }
+  return pid;
+}
+
+
+
+
+// FUNCTION to setup a new Process Descriptor Block (PBD)
+void initialise_pdb(byte pdb_number,char *name)
+{
+    // Joel: I think this works out where to start the storage for the PDB. From stored_pbs ($C000) + pdb_number * 256 (== left bit shift 8).
+  struct process_descriptor_block *p
+    =(struct process_descriptor_block *)(((word)stored_pdbs)+(((word)pdb_number)<<8));
+
+  // Setup process ID (Joel: remember p->element == (*p).element == struct.element)
+  // Joel: Gets a process ID for the process in this PDB, and stores it in p
+  p->process_id = next_free_pid();
+
+  // Setup process name
+  // (32 bytes space for each to fit 16 chars + nul)
+  // (we could just use 17 bytes, but kickc can't multiply by 17)
+  // Joel: This jumps to the beginning of process_names ($C800) + pdb_number * 32 (== left bit shift 5)
+  // to prepare for storing a pointer to the name array of characters
+  p->process_name=process_names+(((word)pdb_number)<<5);
+
+  // XXX - copy the string in the array 'name' into the array 'p->process_name'
+  // XXX - To make your life easier, do something like char *pn=p->process_name
+  // Then you can just do something along the lines of pn[...]=name[...] in a loop to copy the name into place.
+  // (The arrays are both 17 bytes long)
+  // JOEL: loop that copies the passed in name parameter into process_name
+  char *pn = p->process_name;
+  while(*name){
+    *pn++ = *name++;
+  }
+
+  // Set process state as not running.
+  //XXX - Put the value STATE_NOTRUNNING into p->process_state
+  p->process_state = STATE_NEW;
+
+  // Set stored memory area
+  // For now, we just use fixed 8KB (==$2000) steps from $30000-$3FFFF corresponding to the PDB number.
+  // XXX - Set p->storage_start_address to the correct start address for a process that is in this PDB.
+  // The correct address is:
+  p->storage_start_address = $30000 + (((dword)pdb_number)*$2000);
+
+  // XXX - Then do the same for the end address of the process, but starting $1FFF after the start address
+  p->storage_end_address = $31FFF + (((dword)pdb_number)*$2000);
+
+  // Next, we will initialise the processor state for standard entry at $080D
+  // Everything is set to zero, except for a few things we will set manually
+
+  // This assigns 64 bytes for an array to hold the context switching state of each process
+  // Joel: stored_state is a pointer (actually it's the start of an array), so this is a pointer to a pointer
+  // Joel: the stored state pointer is assigned the start of the range + pdb_number * 64 (== left bit shift 6)
+  p->stored_state = process_context_states+(((word)pdb_number)<<6);
+  byte *ss = p->stored_state;
+
+  // XXX - Set all 64 bytes of the array 'ss' to zero, to clear the context switching state
+  for(byte i=0;i<63;i++) ss[i] = $00;
+
+  // Set standard CPU flags (8-bit stack, interrupts disabled)
+  // Joel: not entirely sure what setting $24 in this location does
+  ss[7] = $24;
+
+  // XXX - Set the stack pointer to $01FF
+  // Joel: I think this saves a pointer to the start of the MEMORY STACK (at function invocation) for this process. 
+  // So far we've just set up the memory space for saving the process metadata.
+  // $D645 might hold address of our storage memory?
+  // This requires a bit of fiddly pointer arithmetic, so to save you the trouble working it out,
+  // you can use the following as the left side of the expression:
+  *(word *)&ss[5] = $01FF;
+
+  // where x is the offset of the stack pointer low byte (SPL) in the
+  // Hypervisor saved state registers in Appendix D of the MEGA65 User's
+  // Guide. i.e., if it were at $D640, x would be replaced with 0, and
+  // if it were at $D641, x would be replaced with 1, and so on.
+
+  // XXX - Note that the MEGA65 User's Guide has been updated on FLO.
+  // You will required the latest version, as otherwise SPL is not listed.
+
+  // XXX - Set the program counter to $080D
+  // Joel: I think this is the pointer to the start of the INSTRUCTIONS for this process.
+  // (This requires a bit of fiddly pointer arithmetic, so to save you
+  // the trouble working it out, you can use the following as the left side of the expression:
+  *(word *)&ss[8] = $080D;
+
+  // where x is the offset of the program counter low byte (PCL) in the
+  // Hypervisor saved state registers in Appendix D of the MEGA65 User's Guide.
+
+  return;
+}
+
+
+
+
+// FUNCTION to describe/print a Process Control Block
+void describe_pdb(byte pdb_number)
+{
+  byte i;
+  struct process_descriptor_block *p
+    =(struct process_descriptor_block *)(((word)stored_pdbs)+(((word)pdb_number)<<8));
+
+  print_to_screen("pdb#");
+  print_hex((word)pdb_number);
+  print_to_screen(":");
+  print_newline();
+
+  print_to_screen("  pid:          ");
+  print_hex((word)p->process_id);
+  print_newline();
+
+  print_to_screen("  state:        ");
+  switch(p->process_state) {
+	case STATE_NEW: print_to_screen("new"); break;
+	case STATE_RUNNING: print_to_screen("running"); break;
+	case STATE_BLOCKED: print_to_screen("blocked"); break;
+	case STATE_READY: print_to_screen("ready"); break;
+	case STATE_BLOCKEDSUSPENDED: print_to_screen("blockedsuspended"); break;
+	case STATE_READYSUSPENDED: print_to_screen("readysuspended"); break;
+	case STATE_EXIT: print_to_screen("exit"); break;
+	default:
+	   // Unknown state
+	   print_hex((word)p->process_state);
+  }
+  print_newline();
+
+  print_to_screen("  process name: ");
+  char *n=p->process_name;
+  for(i=0;n[i];i++) {
+    print_char(n[i]);
+  }
+  print_newline();
+
+  print_to_screen("  mem start:    $");
+  print_dhex(p->storage_start_address);
+  print_newline();
+
+  print_to_screen("  mem end:      $");
+  print_dhex(p->storage_end_address);
+  print_newline();
+
+  print_to_screen("  pc:           $");
+  unsigned short *ss=p->stored_state;
+  print_hex(ss[4]);
+  print_newline();
+}
+
+
+
+
+// FUNCTION to load a program into a pdb
+byte load_program(byte pdb_number)
+{
+  // Search through packed programs for the one we need
+  dword address=$20000;
+  byte i;
+  byte match=0;
+
+  struct process_descriptor_block *pdb
+    =(struct process_descriptor_block*)
+    ((word)stored_pdbs+(((word)pdb_number)<<8));
+
+  while(lpeek(address)) {
+    // Check for name match
+    for(i=0;i<16;i++) {
+      byte c1=lpeek(address+i);
+      byte *n=pdb->process_name;
+      byte c2=n[i];
+      if ((c1==0)&&(c2==0)){
+	       match=1;
+	       break;
+	       }
+      if (c1!=c2)
+	     break;
+     }
+
+    if (match) {
+      // Found program -- now copy it into place
+      word length;
+      byte *hb=((byte *)&length)+1;
+      length = lpeek(address+16);
+      *hb = lpeek(address+17);
+
+      // XXX - Make sure it fits the allocated memory
+
+      // Copy program into place.
+      // As the program is formatted as a C64 program with a
+      // $0801 header, we copy it to offset $07FF.
+
+      dword dest=pdb->storage_start_address;
+      dest+=$07FF;
+
+      dma_copy(address+32,dest,length);
+
+      // Mark process as now runnable
+      pdb->process_state=STATE_READY;
+
+      return 0;
+    }
+
+    dword new_address=(dword)lpeek(address+18);
+    new_address|=((dword)(lpeek(address+19)))<<8;
+    new_address|=((dword)(lpeek(address+20)))<<16;
+
+    address=new_address;
+  }
+  // Failed to find program
+  return 1;
+}
+
+
+
+
+// FUNCTION to RESUME a READY process, to make it RUNNING
+void resume_pdb(byte pdb_number)
+{
+  // Make p = the PDB associated with the given pdb_number
+  struct process_descriptor_block *p
+    =(struct process_descriptor_block *)(((word)stored_pdbs)+(((word)pdb_number)<<8));
+
+  // Copy stored memory into place
+  // Copy to $0000-$03FF and $0800-$1FFF, so that we don't overwrite the screen
+  // XXX - Copy $0400 bytes from p->storage_start_address to location $0000
+  // XXX - Copy $1800 bytes from p->storage_start_address+$0800 to location $0800
+  // (Use (unsigned dword)(p->storage_start_address)+offset to pass these addresses
+  // in calls to dma_copy() to cast them to the correct type.)
+  dma_copy((dword)(p->storage_start_address)+(dword)$0000,(dword)$0000,(word)$0400);
+  dma_copy((dword)(p->storage_start_address)+(dword)$0800,(dword)$0800,(word)$1800);
+
+  // Load stored CPU state into Hypervisor saved register area at $FFD3640 (Joel: ??)
+  byte *ss = p->stored_state;
+  // XXX - Use a for() loop to copy 63 bytes from 
+  // ss[0]--ss[62] to ((unsigned char *)$D640)[0]--((unsigned char *)$D640)[62] 
+  // (dma_copy doesn't work for this for some slightly complex reasons.)
+  for(byte i=0;i<63;i++){
+    ((byte *)$D640)[i] = ss[i];
+  }
+
+  // Set state of process to running
+  p->process_state = STATE_RUNNING;
+
+  // Mark this PDB as the running process
+  running_pdb = pdb_number;
+
+  // Exit hypervisor and cause CPU register values (including PC) to be restored from
+  // those loaded from p->stored_state
+  exit_hypervisor();
+}
+
+
+
+
+// FUNCTION to PAUSE a RUNNING process, to make it READY
+// Joel: I think it can also be used to copy a parent process into a child process 
+void pause_pdb(byte pdb_number)
+{
+  // Make p = the PDB associated with the given pdb_number
+  struct process_descriptor_block *p
+    =(struct process_descriptor_block *)(((word)stored_pdbs)+(((word)pdb_number)<<8));
+
+  // Copy running memory into pdb storage place
+  // Copy from $0000-$03FF and $0800-$1FFF
+  // XXX - Copy $0400 bytes from location $0000 to p->storage_start_address
+  // XXX - Copy $1800 bytes from location $0800 to p->storage_start_address+$0800 
+  dma_copy((dword)$0000,(dword)(p->storage_start_address)+(dword)$0000,(word)$0400);
+  dma_copy((dword)$0800,(dword)(p->storage_start_address)+(dword)$0800,(word)$1800);
+
+  // Copy Hypervisor saved register area (at $FFD3640??) into stored CPU state 
+  byte *ss = p->stored_state;
+  // XXX - Use a for() loop to copy 63 bytes from 
+  // ((unsigned char *)$D640)[0]--((unsigned char *)$D640)[62] to ss[0]--ss[62] 
+  for(byte i=0;i<63;i++){
+    ss[i] = ((byte *)$D640)[i];
+  }
+
+	// only runs if we're pausing the currently running proces
+  if(p->process_state == STATE_RUNNING){ 
+  
+  	// Set state of process to ready
+  	p->process_state = STATE_READY;
+  	
+  	// Change the running process to no process
+  	running_pdb = $FF;
+  }
+  
+}
+
+
+
+// *********  IPC MESSAGES  ***************
+
+// IPC Message structure: 16 bytes in total
+struct ipc_message {
+	byte from;
+	byte to;
+	byte priority;
+	byte sequence;
+	byte[12]message;
+};
+
+
+// We will have 16 slots of 16 bytes at $CB00-$CBFF
+const byte *ipc_messages = $CB00;
+volatile byte ipc_message_count;
+
+
+
+// FUNCTION: if the queue has space (<16) then this creates a new struct and copies the passed parameters into it
+void queue_message(byte from, byte to, byte priority, byte sequence, byte *message){
+	
+	if (ipc_message_count>15) return;
+
+	// creates a struct and copies the passed parameters in
+	struct ipc_message *m = (struct ipc_message *)(ipc_messages+ipc_message_count*16);
+	m->from=from;
+	m->to=to;
+	m->priority=priority;
+	m->sequence=sequence;
+	for(byte i=0;i<12;i++)m->message[i]=message[i];
+	
+	// Change the state of the "to" process. The "to" field is a process id. This code finds the associated process descriptor block. 
+	for(byte i=0;i<8;i++){
+		struct process_descriptor_block *pdb
+			=(struct process_descriptor_block*)((word)stored_pdbs+(((word)i)<<8));
+		if(pdb->process_id == to){
+			pdb->process_state = STATE_READY;
+		}
+	}		
+	ipc_message_count++;  
+}
+
+
+// FUNCTION: removes an IPC message from the queue (by copying the last message in the queue over it and decrementing the message count)
+void dequeue_message(byte message_num){
+
+	if(message_num>=ipc_message_count) return; // doesn't do anything if the message doesn't exist (greater than message count)
+	if(message_num==(ipc_message_count-1)){ // decrements message_count to effectively remove the message if it is at the end of the queue
+		byte *last = (byte *)((word)ipc_messages+(ipc_message_count-1)*16);
+		for(byte i=0;i<16;i++)last[i]=0xff; //replaces all the content of the message with FFs, so can't be found in get_next_message
+		ipc_message_count--; 
+		return;
+	}
+	// copies the last message in the queue into the dequeued message spot (to avoid fragmentation) and decrements the message count
+	byte *dest = (byte *)((word)ipc_messages+message_num*16);
+	byte *src  = (byte *)((word)ipc_messages+(ipc_message_count-1)*16);
+	for(byte i=0;i<16;i++)dest[i]=src[i];
+	for(byte i=0;i<16;i++)src[i]=0xff; //replaces all the content of the message with FFs, so can't be found in get_next_message
+	ipc_message_count--;
+}
+
+
+
+// FUNCTION: find the next message addressed to the Process ID passed in (will return a number from 0 to 15)
+byte get_next_message_id(byte receiver){
+	
+	byte best_message=0xFF;
+	byte highest_priority=0;
+	
+	// loops through the IPC messages to find the best match for this receiver (based on highest_priority)
+	for(byte i=0;i<16;i++){
+		struct ipc_message *m = (struct ipc_message *)(ipc_messages+i*16);
+		if(m->to==receiver){
+			if(m->priority>highest_priority){
+				best_message=i;
+				highest_priority = m->priority;
+			}
+		}
+	}
+	return best_message;
+}
+
+
+
+// FUNCTION: returns the address of the IPC message number passed to it
+struct ipc_message *get_pointer_to_message(byte id){
+	return(struct ipc_message *)(ipc_messages+id*16);
+}
+
+
+
+
+
+// *********  MAIN and EXIT HYPERVISOR functions  ***************
+
+// FUNCTION for main
+void main(){
+  // empty main function for now
+}
+
+
+// FUNCTION to trigger exit from Hypervisor mode
+void exit_hypervisor()
+{
+	// Exit hypervisor
+	*(byte *)$D67F = $01;
+}
+
+
+
+
+// *********  SYSCALLS and TRAPS  ***************
+
+// SYSCALL FUNCTIONS
+void syscall00(){exit_hypervisor();}
+void syscall01(){exit_hypervisor();}
+void syscall02(){exit_hypervisor();}
+void syscall03(){describe_pdb(running_pdb);exit_hypervisor();}
+void syscall04(){exit_hypervisor();}
+
+void syscall05(){
+	// Yield the running process to another process
+	// Restarts the last process if no other ready process is found
+	byte next_pdb = running_pdb;
+	if(next_pdb<8) pause_pdb(running_pdb); //only pauses a pdb is one is currently running (i.e. if running_pdb is not set to FF)
+	for(byte i=0;i<8;i++){
+		if(i == next_pdb) continue;
+		struct process_descriptor_block *pdb
+			=(struct process_descriptor_block*)((word)stored_pdbs+(((word)i)<<8));		
+		if(pdb->process_state == STATE_READY){next_pdb = i;break;}
+	}
+	resume_pdb(next_pdb);
+	exit_hypervisor(); // never gets here cause exits hypervisor in resume_pdb()
+}
+
+void syscall06(){
+	// Display PID of current process
+	byte pid;
+	struct process_descriptor_block *pdb
+		=(struct process_descriptor_block*)((word)stored_pdbs+(((word)running_pdb)<<8));
+	print_to_screen("you are pid ");
+	print_hex(pdb->process_id);
+	print_to_screen(" in pdb ");
+	print_hex(running_pdb);
+	print_newline();
+	exit_hypervisor();
+}
+	
+void syscall07(){
+	// Forks the current process
+	byte parent_pdb = running_pdb;
+	byte child_pdb = $00;
+	pause_pdb(running_pdb);
+	
+	for(byte i=0;i<8;i++){
+		struct process_descriptor_block *pdb
+			=(struct process_descriptor_block*)((word)stored_pdbs+(((word)i)<<8));		
+		if(pdb->process_id == 0){child_pdb = i; break;}
+	}
+		
+	initialise_pdb(child_pdb,"temp_child_name");
+	
+	*(byte *)$0300 = $00;
+	pause_pdb(child_pdb);
+	
+	struct process_descriptor_block *p
+		=(struct process_descriptor_block*)((word)stored_pdbs+(((word)child_pdb)<<8));
+	*(byte *)$0300 = p->process_id;
+  
+  running_pdb = parent_pdb;
+  exit_hypervisor();
+}
+  
+void syscall08(){
+	// Execs the current process
+	struct process_descriptor_block *pdb
+		=(struct process_descriptor_block*)((word)stored_pdbs+(((word)running_pdb)<<8));
+	char *pname = pdb->process_name;
+	char *oname = $0300;
+ 	while(*oname){*pname++ = *oname++;}
+  *pname = 0; // terminating null
+  
+	load_program(running_pdb);
+	
+	// setup new program
+	byte *ss = pdb->stored_state;
+  for(byte i=0;i<63;i++) ss[i] = $00;
+  ss[7] = $24;
+  *(word *)&ss[5] = $01FF;
+  *(word *)&ss[8] = $080D;
+  
+	resume_pdb(running_pdb);	
+	exit_hypervisor(); // shouldn't ever reach here, exits in resume_pdb function
+}
+
+void syscall09(){
+	// checks for messages for the current process and copies the first one to $0300 
+	struct process_descriptor_block *pdb
+		=(struct process_descriptor_block*)((word)stored_pdbs+(((word)running_pdb)<<8));
+	byte caller_pid = pdb->process_id;
+	
+	//get the next IPC message id for this process id
+	byte message_id = get_next_message_id(caller_pid);
+	
+	// yield and set state to blocked while there are no messages waiting
+	if(message_id==0xff){
+		for(byte i=0;i<16;i++)*(byte *)($0300+i)=0xff;
+		pdb->process_state = STATE_BLOCKED;
+		pause_pdb(running_pdb);
+		syscall05();
+	}
+	
+	if(message_id!=0xff){
+		// We have a message to return
+		struct ipc_message *m = get_pointer_to_message(message_id);
+		// Copy the IPC message to the transfer area
+		dma_copy((word)m,$0300,16);
+		// Dequeue the message
+		dequeue_message(message_id);
+		// Return from operating system back into the calling program
+		exit_hypervisor();
+	} 
+	
+	exit_hypervisor(); //should never reach here, exits hypervisor in either of the two if statements above
+}
+
+void syscall0A(){
+	// Saves an IPC message from the current process into the queue for delivery to another process
+	// Initialise an IPC Message pointer to point to $0300
+	struct ipc_message *m = $0300;
+	
+	// Get current process id
+	struct process_descriptor_block *pdb
+		=(struct process_descriptor_block*)((word)stored_pdbs+(((word)running_pdb)<<8));
+	byte caller_pid = pdb->process_id;
+	
+	// Queue the message
+	queue_message(caller_pid, m->to, m->priority, m->sequence, m->message);
+		
+	exit_hypervisor();
+}
+void syscall0B(){exit_hypervisor();}
+void syscall0C(){exit_hypervisor();}
+void syscall0D(){exit_hypervisor();}
+void syscall0E(){exit_hypervisor();}
+void syscall0F(){exit_hypervisor();}
+void syscall10(){exit_hypervisor();}
+void securentr(){exit_hypervisor();}
+void securexit(){exit_hypervisor();}
+void syscall13(){exit_hypervisor();}
+void syscall14(){exit_hypervisor();}
+void syscall15(){exit_hypervisor();}
+void syscall16(){exit_hypervisor();}
+void syscall17(){exit_hypervisor();}
+void syscall18(){exit_hypervisor();}
+void syscall19(){exit_hypervisor();}
+void syscall1A(){exit_hypervisor();}
+void syscall1B(){exit_hypervisor();}
+void syscall1C(){exit_hypervisor();}
+void syscall1D(){exit_hypervisor();}
+void syscall1E(){exit_hypervisor();}
+void syscall1F(){exit_hypervisor();}
+void syscall20(){exit_hypervisor();}
+void syscall21(){exit_hypervisor();}
+void syscall22(){exit_hypervisor();}
+void syscall23(){exit_hypervisor();}
+void syscall24(){exit_hypervisor();}
+void syscall25(){exit_hypervisor();}
+void syscall26(){exit_hypervisor();}
+void syscall27(){exit_hypervisor();}
+void syscall28(){exit_hypervisor();}
+void syscall29(){exit_hypervisor();}
+void syscall2A(){exit_hypervisor();}
+void syscall2B(){exit_hypervisor();}
+void syscall2C(){exit_hypervisor();}
+void syscall2D(){exit_hypervisor();}
+void syscall2E(){exit_hypervisor();}
+void syscall2F(){exit_hypervisor();}
+void syscall30(){exit_hypervisor();}
+void syscall31(){exit_hypervisor();}
+void syscall32(){exit_hypervisor();}
+void syscall33(){exit_hypervisor();}
+void syscall34(){exit_hypervisor();}
+void syscall35(){exit_hypervisor();}
+void syscall36(){exit_hypervisor();}
+void syscall37(){exit_hypervisor();}
+void syscall38(){exit_hypervisor();}
+void syscall39(){exit_hypervisor();}
+void syscall3A(){exit_hypervisor();}
+void syscall3B(){exit_hypervisor();}
+void syscall3C(){exit_hypervisor();}
+void syscall3D(){exit_hypervisor();}
+void syscall3E(){exit_hypervisor();}
+void syscall3F(){exit_hypervisor();}
+
+
+
+
+
+//****************** RESET *************************
+
+
+
+
+
+// TRAP FUNCTIONS - the RESET function
+void reset(){
+  // Initialise screen memory, and selects correct font
+  *VIC_MEMORY = 0x14;
+  // Fill the screen with spaces
+  memset(SCREEN,' ',40*25);
+  // Set the colour of every character on the screen to white
+  memset(COLS,WHITE,40*25);
+
+  // print these messages on the screens
+  current_screen_line = SCREEN + 400;
+  //print_to_screen(MESSAGE);
+  //print_newline();
+
+	// Start with empty message queue
+	ipc_message_count=0;
+	
+	// Initialise PDB slot 0 to hold program6
+  initialise_pdb(0,"program6.prg");
+	// Load program6 (in PDB slot 0)
+  load_program(0);
+  
+  // Initialise PDB slot 1 to hold program5
+  initialise_pdb(1,"program5.prg");
+	// Load program5 (in PDB slot 1)
+  load_program(1);
+  
+  // Run program6 in PDB #0
+  resume_pdb(0);
+  
+  //print_raster_lines();
+  while(true){}  // loop to stop the rest of the code executing (for now)
+}
+
+
+
+
+
+//********************** END RESET *************************
+
+
+
+
+
+// The rest of the TRAP FUNCTIONS
+void pagfault(){exit_hypervisor();}
+void restorkey(){exit_hypervisor();}
+void alttabkey(){exit_hypervisor();}
+void vF011rd(){exit_hypervisor();}
+void vF011wr(){exit_hypervisor();}
+void reserved(){exit_hypervisor();} // Can define specific functions for all the reserved traps later
+void cpukil(){exit_hypervisor();}
+
+
+
+// Now we select the SYSCALL segment to hold the SYSCALL/trap entry point table
+#pragma data_seg(Syscall)
+
+// The structure of each entry point is JMP + (handler address) + NOP.
+// We have a char (xjmp) to hold the opcode for the JMP instruction, and then put the address of the
+// SYSCALL/trap handler in the next two points as a pointer, and end with the NOP instruction opcode.
+
+struct SysCall {
+  char xjmp;           // Holds $4C, the JMP $nnnn opcode
+  void()* syscall;     // Holds the handler address, will be the target of the JMP
+  char xnop;           // Holds $EA, the NOP opcode
+};
+
+// To save writing 0x4C and 0xEA all the time, we define them as constants
+const char JMP = 0x4c;
+const char NOP = 0xea;
+
+// Now we can have a nice table of up to 64 SYSCALL handlers expressed in a fairly readable and easy format.
+// Each line is an instance of the struct SysCall from above, with the JMP opcode value, the address of the handler
+// routine and the NOP opcode value.
+export struct SysCall[] SYSCALLS = {
+{JMP,&syscall00,NOP},
+{JMP,&syscall01,NOP},
+{JMP,&syscall02,NOP},
+{JMP,&syscall03,NOP},
+{JMP,&syscall04,NOP},
+{JMP,&syscall05,NOP},
+{JMP,&syscall06,NOP},
+{JMP,&syscall07,NOP},
+{JMP,&syscall08,NOP},
+{JMP,&syscall09,NOP},
+{JMP,&syscall0A,NOP},
+{JMP,&syscall0B,NOP},
+{JMP,&syscall0C,NOP},
+{JMP,&syscall0D,NOP},
+{JMP,&syscall0E,NOP},
+{JMP,&syscall0F,NOP},
+{JMP,&syscall10,NOP},
+{JMP,&securentr,NOP},
+{JMP,&securexit,NOP},
+{JMP,&syscall13,NOP},
+{JMP,&syscall14,NOP},
+{JMP,&syscall15,NOP},
+{JMP,&syscall16,NOP},
+{JMP,&syscall17,NOP},
+{JMP,&syscall18,NOP},
+{JMP,&syscall19,NOP},
+{JMP,&syscall1A,NOP},
+{JMP,&syscall1B,NOP},
+{JMP,&syscall1C,NOP},
+{JMP,&syscall1D,NOP},
+{JMP,&syscall1E,NOP},
+{JMP,&syscall1F,NOP},
+{JMP,&syscall20,NOP},
+{JMP,&syscall21,NOP},
+{JMP,&syscall22,NOP},
+{JMP,&syscall23,NOP},
+{JMP,&syscall24,NOP},
+{JMP,&syscall25,NOP},
+{JMP,&syscall26,NOP},
+{JMP,&syscall27,NOP},
+{JMP,&syscall28,NOP},
+{JMP,&syscall29,NOP},
+{JMP,&syscall2A,NOP},
+{JMP,&syscall2B,NOP},
+{JMP,&syscall2C,NOP},
+{JMP,&syscall2D,NOP},
+{JMP,&syscall2E,NOP},
+{JMP,&syscall2F,NOP},
+{JMP,&syscall30,NOP},
+{JMP,&syscall31,NOP},
+{JMP,&syscall32,NOP},
+{JMP,&syscall33,NOP},
+{JMP,&syscall34,NOP},
+{JMP,&syscall35,NOP},
+{JMP,&syscall36,NOP},
+{JMP,&syscall37,NOP},
+{JMP,&syscall38,NOP},
+{JMP,&syscall39,NOP},
+{JMP,&syscall3A,NOP},
+{JMP,&syscall3B,NOP},
+{JMP,&syscall3C,NOP},
+{JMP,&syscall3D,NOP},
+{JMP,&syscall3E,NOP},
+{JMP,&syscall3F,NOP}
+};
+
+// Originally we had only two SYSCALLs defined, so "align" tells KickC to
+//  make the TRAP table begin at the next multiple of $100, i.e., at $8100.
+export align (0x100) struct SysCall[] TRAPS = {
+  {JMP,&reset,NOP},
+  {JMP,&pagfault,NOP},
+  {JMP,&restorkey,NOP},
+  {JMP,&alttabkey,NOP},
+  {JMP,&vF011rd,NOP},
+  {JMP,&vF011wr,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&reserved,NOP},
+  {JMP,&cpukil,NOP}
+};

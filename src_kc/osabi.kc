@@ -1,0 +1,114 @@
+
+void enable_syscalls() {
+	*(byte *)$D02F = $47;
+	*(byte *)$D02F = $53;
+}
+
+void process_info()
+{
+	enable_syscalls();
+	*(byte *)$D643 = $00;
+	asm { nop }
+}
+
+void end_program()
+{
+	enable_syscalls();
+	*(byte *)$D644 = $00;
+	asm { nop }
+}
+
+void yield()
+{  
+	enable_syscalls();
+	*(byte *)$D645 = $00;
+	asm { nop }
+}
+
+void showpid()
+{
+	enable_syscalls();
+	*(byte *)$D646 = $00;
+	asm { nop }
+}
+
+byte fork()
+{
+	enable_syscalls();
+	*(byte *)$D647 = $00;
+	asm { nop }
+        return *(byte*)$0300;
+}
+
+void exec(byte *program_name)
+{
+  // Copy the program_name parameter to the transfer area at $0300, 
+  // which is accessible by both user and op_system
+  byte *str_mem = $0300;
+  while(*program_name){
+    *str_mem++ = *program_name++;
+  }
+  *str_mem = 0; // terminating null at the end of the string. Not copied for some reason.
+
+	enable_syscalls();
+	*(byte *)$D648 = $00;
+	asm { nop }
+}
+
+// STRUCT: Define the IPC Message structure: 16 bytes in total
+struct ipc_message {
+	byte from;
+	byte to;
+	byte priority;
+	byte sequence;
+	byte[12]message;
+};
+
+// VARIABLE: Initialise a struct to temporarily hold (buffer) ipc_messages as they are passed back and forth
+struct ipc_message[1] ipc_buffer;
+
+// FUNCTION: returns a pointer to the ipc_message buffer, which contains the IPC message that was stored at $0300
+struct ipc_message *ipc_read(){
+	enable_syscalls();
+	*(byte *)$D649 = $00; // this runs the code in syscall09
+	asm { nop }
+	
+	enable_syscalls();
+	*(byte *)$D649 = $00; // this runs the code in syscall09
+	asm { nop }
+		
+	// Copy returned structure into return buffer
+	byte *a = (byte *)ipc_buffer;
+	byte *b = (byte *)$0300;
+	for(byte i=0;i<16;i++)a[i]=b[i]; //copies 16 places because structs are 16 bytes long by design
+	
+	// Return address of return buffer
+	return ipc_buffer;
+}
+
+// FUNCTION: for processes to send messages to another process
+void ipc_send(byte to, byte priority, byte sequence, byte *message){
+
+	// Copy IPC Message into $0300 
+	byte *a = (byte *)$0300;
+	byte *m = (byte *)message;
+	*a++ = 0xff;
+	*a++ = to;
+	*a++ = priority;
+	*a++ = sequence;
+	while(*m){
+		*a++ = *m++;
+  }
+  *a = 0; // terminating null at the end of the string. 
+	
+	enable_syscalls();
+	*(byte *)$D64A = $00; // this runs the code in syscall0A
+	asm { nop }
+}
+
+
+
+
+
+
+
