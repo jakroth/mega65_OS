@@ -1,4 +1,4 @@
-This is a rudimentary operating system for the Mega65 (a modern offshoot of the Commodore 64). 
+This is a rudimentary operating system I wrote for the Mega65 (a modern offshoot of the Commodore 64). 
 
 Built for the topic Operating Systems in 2019 at Flinders University. 
 
