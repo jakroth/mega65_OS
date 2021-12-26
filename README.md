@@ -1,6 +1,6 @@
 This is a rudimentary operating system for the Mega65 (a modern offshoot of the Commodore 64). 
 
-Built for the topic Operating Systems in 2019. 
+Built for the topic Operating Systems in 2019 at Flinders University. 
 
 Uses the Kick-C compiler and the xmega65 emulator. Both need to be installed to run these files. 
 
